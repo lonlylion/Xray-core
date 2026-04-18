@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	core "github.com/xtls/xray-core/core"
@@ -28,6 +29,8 @@ var (
 		"vmess":         func() interface{} { return new(VMessInboundConfig) },
 		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"wireguard":     func() interface{} { return &WireGuardConfig{IsClient: false} },
+		"hysteria":      func() interface{} { return new(HysteriaServerConfig) },
+		"tun":           func() interface{} { return new(TunConfig) },
 	}, "protocol", "settings")
 
 	outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{
@@ -42,50 +45,54 @@ var (
 		"vless":       func() interface{} { return new(VLessOutboundConfig) },
 		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
 		"trojan":      func() interface{} { return new(TrojanClientConfig) },
+		"hysteria":    func() interface{} { return new(HysteriaClientConfig) },
 		"dns":         func() interface{} { return new(DNSOutboundConfig) },
 		"wireguard":   func() interface{} { return &WireGuardConfig{IsClient: true} },
 	}, "protocol", "settings")
 )
 
 type SniffingConfig struct {
-	Enabled         bool        `json:"enabled"`
-	DestOverride    *StringList `json:"destOverride"`
-	DomainsExcluded *StringList `json:"domainsExcluded"`
-	MetadataOnly    bool        `json:"metadataOnly"`
-	RouteOnly       bool        `json:"routeOnly"`
+	Enabled         bool       `json:"enabled"`
+	DestOverride    StringList `json:"destOverride"`
+	DomainsExcluded StringList `json:"domainsExcluded"`
+	IPsExcluded     StringList `json:"ipsExcluded"`
+	MetadataOnly    bool       `json:"metadataOnly"`
+	RouteOnly       bool       `json:"routeOnly"`
 }
 
 // Build implements Buildable.
 func (c *SniffingConfig) Build() (*proxyman.SniffingConfig, error) {
-	var p []string
-	if c.DestOverride != nil {
-		for _, protocol := range *c.DestOverride {
-			switch strings.ToLower(protocol) {
-			case "http":
-				p = append(p, "http")
-			case "tls", "https", "ssl":
-				p = append(p, "tls")
-			case "quic":
-				p = append(p, "quic")
-			case "fakedns", "fakedns+others":
-				p = append(p, "fakedns")
-			default:
-				return nil, errors.New("unknown protocol: ", protocol)
-			}
+	var protocols []string
+	for _, protocol := range c.DestOverride {
+		switch strings.ToLower(protocol) {
+		case "http":
+			protocols = append(protocols, "http")
+		case "tls", "https", "ssl":
+			protocols = append(protocols, "tls")
+		case "quic":
+			protocols = append(protocols, "quic")
+		case "fakedns", "fakedns+others":
+			protocols = append(protocols, "fakedns")
+		default:
+			return nil, errors.New("unknown protocol: ", protocol)
 		}
 	}
 
-	var d []string
-	if c.DomainsExcluded != nil {
-		for _, domain := range *c.DomainsExcluded {
-			d = append(d, strings.ToLower(domain))
-		}
+	domains, err := geodata.ParseDomainRules(c.DomainsExcluded, geodata.Domain_Substr)
+	if err != nil {
+		return nil, err
+	}
+
+	ips, err := geodata.ParseIPRules(c.IPsExcluded)
+	if err != nil {
+		return nil, err
 	}
 
 	return &proxyman.SniffingConfig{
 		Enabled:             c.Enabled,
-		DestinationOverride: p,
-		DomainsExcluded:     d,
+		DestinationOverride: protocols,
+		DomainsExcluded:     domains,
+		IpsExcluded:         ips,
 		MetadataOnly:        c.MetadataOnly,
 		RouteOnly:           c.RouteOnly,
 	}, nil
@@ -116,20 +123,23 @@ func (m *MuxConfig) Build() (*proxyman.MultiplexingConfig, error) {
 }
 
 type InboundDetourConfig struct {
-	Protocol       string                         `json:"protocol"`
-	PortList       *PortList                      `json:"port"`
-	ListenOn       *Address                       `json:"listen"`
-	Settings       *json.RawMessage               `json:"settings"`
-	Tag            string                         `json:"tag"`
-	StreamSetting  *StreamConfig                  `json:"streamSettings"`
-	SniffingConfig *SniffingConfig                `json:"sniffing"`
+	Protocol       string           `json:"protocol"`
+	PortList       *PortList        `json:"port"`
+	ListenOn       *Address         `json:"listen"`
+	Settings       *json.RawMessage `json:"settings"`
+	Tag            string           `json:"tag"`
+	StreamSetting  *StreamConfig    `json:"streamSettings"`
+	SniffingConfig *SniffingConfig  `json:"sniffing"`
 }
 
 // Build implements Buildable.
 func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 	receiverSettings := &proxyman.ReceiverConfig{}
 
-	if c.ListenOn == nil {
+	// TUN inbound doesn't need port configuration as it uses network interface instead
+	if strings.ToLower(c.Protocol) == "tun" {
+		// Skip port validation for TUN
+	} else if c.ListenOn == nil {
 		// Listen on anyip, must set PortList
 		if c.PortList == nil {
 			return nil, errors.New("Listen on AnyIP but no Port(s) set in InboundDetour.")
@@ -163,6 +173,10 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 			return nil, err
 		}
 		receiverSettings.StreamSettings = ss
+		if strings.Contains(ss.SecurityType, "reality") && (receiverSettings.PortList == nil ||
+			len(receiverSettings.PortList.Ports()) != 1 || receiverSettings.PortList.Ports()[0] != 443) {
+			errors.LogWarning(context.Background(), `REALITY: Listening on non-443 ports may get your IP blocked by the GFW`)
+		}
 	}
 	if c.SniffingConfig != nil {
 		s, err := c.SniffingConfig.Build()
